@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub profile: Option<String>,
     pub region: Option<String>,
     pub command: String,
+    pub inspect: bool,
 }
 
 /// Execution plan determined from config + user interaction.
@@ -38,6 +39,13 @@ pub struct TaskInfo {
     pub id: String,
     pub last_status: String,
     pub container_names: Vec<String>,
+    pub attachment_details: Vec<AttachmentDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentDetail {
+    pub name: String,
+    pub value: String,
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -56,6 +64,11 @@ pub trait EcsApi: Send + Sync {
         cluster: &'a str,
         task_id: &'a str,
     ) -> BoxFuture<'a, Result<Vec<String>>>;
+    fn describe_tasks<'a>(
+        &'a self,
+        cluster: &'a str,
+        task_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<Vec<TaskInfo>>>;
 }
 
 /// Abstraction over user prompts to keep business logic testable.
@@ -72,46 +85,7 @@ pub async fn build_plan(
     ecs: &dyn EcsApi,
     prompter: &dyn Prompter,
 ) -> Result<ExecutionPlan> {
-    let cluster = match cfg.cluster.clone() {
-        Some(c) => c,
-        None => {
-            let clusters = ecs.list_clusters().await?;
-            if clusters.is_empty() {
-                return Err(anyhow!("No ECS clusters found"));
-            }
-            prompter.select_cluster(clusters)?
-        }
-    };
-
-    let service = match cfg.service.clone() {
-        Some(s) => s,
-        None => {
-            let services = ecs.list_services(&cluster).await?;
-            if services.is_empty() {
-                return Err(anyhow!("No services found in cluster {}", cluster));
-            }
-            prompter.select_service(services)?
-        }
-    };
-
-    let task_info = match cfg.task.clone() {
-        Some(t) => TaskInfo {
-            id: t,
-            last_status: "UNKNOWN".into(),
-            container_names: vec![],
-        },
-        None => {
-            let tasks = ecs.list_running_tasks(&cluster, &service).await?;
-            if tasks.is_empty() {
-                return Err(anyhow!(
-                    "No RUNNING tasks found for service {} in cluster {}",
-                    service,
-                    cluster
-                ));
-            }
-            prompter.select_task(tasks)?
-        }
-    };
+    let (cluster, service, task_info) = resolve_cluster_service_task(cfg, ecs, prompter).await?;
 
     let container = match cfg.container.clone() {
         Some(c) => c,
@@ -176,6 +150,48 @@ pub fn execute_plan(plan: &ExecutionPlan) -> Result<()> {
     if !status.success() {
         return Err(anyhow!("aws ecs execute-command exited with {:?}", status));
     }
+
+    Ok(())
+}
+
+/// Inspect tasks and print a summary table (status + IP/ENI where available).
+pub async fn inspect_tasks(
+    cfg: &AppConfig,
+    ecs: &dyn EcsApi,
+    prompter: &dyn Prompter,
+) -> Result<()> {
+    let cluster = resolve_cluster(cfg, ecs, prompter).await?;
+
+    let service = if cfg.task.is_some() && cfg.service.is_none() {
+        None
+    } else {
+        Some(resolve_service(cfg, ecs, prompter, &cluster).await?)
+    };
+
+    let mut tasks = if let Some(task_id) = cfg.task.clone() {
+        let described = ecs.describe_tasks(&cluster, vec![task_id.clone()]).await?;
+        if described.is_empty() {
+            return Err(anyhow!("Task not found: {}", task_id));
+        }
+        described
+    } else {
+        let service = service
+            .as_deref()
+            .ok_or_else(|| anyhow!("Service must be specified to list tasks"))?;
+        let tasks = ecs.list_running_tasks(&cluster, service).await?;
+        if tasks.is_empty() {
+            return Err(anyhow!(
+                "No RUNNING tasks found for service {} in cluster {}",
+                service,
+                cluster
+            ));
+        }
+        tasks
+    };
+
+    tasks.sort_by(|a, b| a.id.cmp(&b.id));
+    let output = format_task_table(&cluster, service.as_deref(), &tasks);
+    print!("{}", output);
 
     Ok(())
 }
@@ -269,21 +285,7 @@ impl EcsApi for AwsEcsApi {
                 .tasks
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|t| {
-                    let task_arn = t.task_arn?;
-                    let last_status = t.last_status.unwrap_or_else(|| "UNKNOWN".into());
-                    let containers = t
-                        .containers
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|c| c.name)
-                        .collect::<Vec<_>>();
-                    Some(TaskInfo {
-                        id: extract_name(&task_arn),
-                        last_status,
-                        container_names: containers,
-                    })
-                })
+                .filter_map(task_info_from_sdk)
                 .collect();
 
             Ok(tasks)
@@ -314,6 +316,32 @@ impl EcsApi for AwsEcsApi {
                 .collect::<Vec<_>>();
 
             Ok(containers)
+        })
+    }
+
+    fn describe_tasks<'a>(
+        &'a self,
+        cluster: &'a str,
+        task_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<Vec<TaskInfo>>> {
+        Box::pin(async move {
+            let described = self
+                .client
+                .describe_tasks()
+                .cluster(cluster)
+                .set_tasks(Some(task_ids))
+                .send()
+                .await
+                .context("failed to describe tasks")?;
+
+            let tasks = described
+                .tasks
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(task_info_from_sdk)
+                .collect();
+
+            Ok(tasks)
         })
     }
 }
@@ -383,6 +411,220 @@ fn extract_name(arn: &str) -> String {
     arn.split('/').last().unwrap_or(arn).to_string()
 }
 
+fn task_info_from_sdk(task: aws_sdk_ecs::types::Task) -> Option<TaskInfo> {
+    let task_arn = task.task_arn?;
+    let last_status = task.last_status.unwrap_or_else(|| "UNKNOWN".into());
+    let containers = task
+        .containers
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| c.name)
+        .collect::<Vec<_>>();
+    let attachment_details = task
+        .attachments
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|a| a.details.unwrap_or_default())
+        .filter_map(|d| {
+            Some(AttachmentDetail {
+                name: d.name?,
+                value: d.value?,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(TaskInfo {
+        id: extract_name(&task_arn),
+        last_status,
+        container_names: containers,
+        attachment_details,
+    })
+}
+
+async fn resolve_cluster(
+    cfg: &AppConfig,
+    ecs: &dyn EcsApi,
+    prompter: &dyn Prompter,
+) -> Result<String> {
+    match cfg.cluster.clone() {
+        Some(c) => Ok(c),
+        None => {
+            let clusters = ecs.list_clusters().await?;
+            if clusters.is_empty() {
+                return Err(anyhow!("No ECS clusters found"));
+            }
+            prompter.select_cluster(clusters)
+        }
+    }
+}
+
+async fn resolve_service(
+    cfg: &AppConfig,
+    ecs: &dyn EcsApi,
+    prompter: &dyn Prompter,
+    cluster: &str,
+) -> Result<String> {
+    match cfg.service.clone() {
+        Some(s) => Ok(s),
+        None => {
+            let services = ecs.list_services(cluster).await?;
+            if services.is_empty() {
+                return Err(anyhow!("No services found in cluster {}", cluster));
+            }
+            prompter.select_service(services)
+        }
+    }
+}
+
+async fn resolve_cluster_service_task(
+    cfg: &AppConfig,
+    ecs: &dyn EcsApi,
+    prompter: &dyn Prompter,
+) -> Result<(String, String, TaskInfo)> {
+    let cluster = resolve_cluster(cfg, ecs, prompter).await?;
+    let service = resolve_service(cfg, ecs, prompter, &cluster).await?;
+
+    let task_info = match cfg.task.clone() {
+        Some(t) => TaskInfo {
+            id: t,
+            last_status: "UNKNOWN".into(),
+            container_names: vec![],
+            attachment_details: vec![],
+        },
+        None => {
+            let tasks = ecs.list_running_tasks(&cluster, &service).await?;
+            if tasks.is_empty() {
+                return Err(anyhow!(
+                    "No RUNNING tasks found for service {} in cluster {}",
+                    service,
+                    cluster
+                ));
+            }
+            prompter.select_task(tasks)?
+        }
+    };
+
+    Ok((cluster, service, task_info))
+}
+
+fn format_task_table(cluster: &str, service: Option<&str>, tasks: &[TaskInfo]) -> String {
+    let mut lines = Vec::new();
+    let service_label = service.unwrap_or("-");
+    lines.push(format!(
+        "Task Status (cluster: {}, service: {})",
+        cluster, service_label
+    ));
+
+    if tasks.is_empty() {
+        lines.push("No tasks found.".to_string());
+        return format!("{}\n", lines.join("\n"));
+    }
+
+    let headers = vec![
+        "Task ID".to_string(),
+        "Status".to_string(),
+        "Private IP".to_string(),
+        "Public IP".to_string(),
+        "ENI".to_string(),
+        "Containers".to_string(),
+    ];
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for task in tasks {
+        let net = task_network_summary(task);
+        rows.push(vec![
+            task.id.clone(),
+            task.last_status.clone(),
+            join_or_dash(&net.private_ips),
+            join_or_dash(&net.public_ips),
+            join_or_dash(&net.enis),
+            join_or_dash(&task.container_names),
+        ]);
+    }
+
+    let mut widths = vec![0usize; headers.len()];
+    for (idx, header) in headers.iter().enumerate() {
+        widths[idx] = header.len();
+    }
+    for row in &rows {
+        for (idx, col) in row.iter().enumerate() {
+            if col.len() > widths[idx] {
+                widths[idx] = col.len();
+            }
+        }
+    }
+
+    lines.push(format_row(&headers, &widths));
+    lines.push(format_separator(&widths));
+    for row in rows {
+        lines.push(format_row(&row, &widths));
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn format_row(cols: &[String], widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (idx, col) in cols.iter().enumerate() {
+        if idx > 0 {
+            line.push_str("  ");
+        }
+        let width = widths[idx];
+        line.push_str(&format!("{:<width$}", col, width = width));
+    }
+    line
+}
+
+fn format_separator(widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (idx, width) in widths.iter().enumerate() {
+        if idx > 0 {
+            line.push_str("  ");
+        }
+        line.push_str(&"-".repeat(*width));
+    }
+    line
+}
+
+fn join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+struct NetworkSummary {
+    private_ips: Vec<String>,
+    public_ips: Vec<String>,
+    enis: Vec<String>,
+}
+
+fn task_network_summary(task: &TaskInfo) -> NetworkSummary {
+    let mut summary = NetworkSummary {
+        private_ips: Vec::new(),
+        public_ips: Vec::new(),
+        enis: Vec::new(),
+    };
+
+    for detail in &task.attachment_details {
+        match detail.name.as_str() {
+            "privateIPv4Address" => push_unique(&mut summary.private_ips, &detail.value),
+            "publicIPv4Address" => push_unique(&mut summary.public_ips, &detail.value),
+            "networkInterfaceId" => push_unique(&mut summary.enis, &detail.value),
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|v| v == value) {
+        values.push(value.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +657,20 @@ mod tests {
             _task_id: &'a str,
         ) -> BoxFuture<'a, Result<Vec<String>>> {
             Box::pin(async move { Ok(self.containers.clone()) })
+        }
+
+        fn describe_tasks<'a>(
+            &'a self,
+            _cluster: &'a str,
+            task_ids: Vec<String>,
+        ) -> BoxFuture<'a, Result<Vec<TaskInfo>>> {
+            let tasks = self
+                .tasks
+                .iter()
+                .filter(|t| task_ids.contains(&t.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            Box::pin(async move { Ok(tasks) })
         }
     }
 
@@ -453,6 +709,7 @@ mod tests {
                 id: "task123".into(),
                 last_status: "RUNNING".into(),
                 container_names: vec!["app".into(), "sidecar".into()],
+                attachment_details: vec![],
             }],
             containers: vec!["app".into(), "sidecar".into()],
         };
@@ -471,6 +728,7 @@ mod tests {
             profile: Some("p".into()),
             region: Some("us-east-1".into()),
             command: "/bin/sh".into(),
+            inspect: false,
         };
 
         let plan = build_plan(&cfg, &ecs, &prompt).await.unwrap();
@@ -501,6 +759,7 @@ mod tests {
             profile: None,
             region: None,
             command: "whoami".into(),
+            inspect: false,
         };
 
         let plan = build_plan(&cfg, &ecs, &prompt).await.unwrap();
@@ -540,11 +799,35 @@ mod tests {
             profile: None,
             region: None,
             command: "/bin/sh".into(),
+            inspect: false,
         };
 
         let err = build_plan(&cfg, &ecs, &prompt).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("No RUNNING tasks found for service s in cluster c"));
+    }
+
+    #[test]
+    fn formats_network_details() {
+        let task = TaskInfo {
+            id: "task1".into(),
+            last_status: "RUNNING".into(),
+            container_names: vec!["app".into()],
+            attachment_details: vec![
+                AttachmentDetail {
+                    name: "privateIPv4Address".into(),
+                    value: "10.0.0.10".into(),
+                },
+                AttachmentDetail {
+                    name: "networkInterfaceId".into(),
+                    value: "eni-123".into(),
+                },
+            ],
+        };
+
+        let output = format_task_table("cluster-a", Some("service-a"), &[task]);
+        assert!(output.contains("10.0.0.10"));
+        assert!(output.contains("eni-123"));
     }
 }

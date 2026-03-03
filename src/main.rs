@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use decs::{build_plan, execute_plan, AppConfig, AwsEcsApi, InquirePrompter};
+use decs::{build_plan, execute_plan, inspect_tasks, AppConfig, AwsEcsApi, InquirePrompter};
 
 /// decs (Dive into ECS): interactively choose ECS resources and exec into a container.
 #[derive(Parser, Debug)]
@@ -33,6 +33,10 @@ struct Cli {
     /// Command to run inside the container (defaults to /bin/sh)
     #[arg(short = 'x', long, default_value = "/bin/sh")]
     command: String,
+
+    /// Inspect task details and exit (no exec)
+    #[arg(long)]
+    inspect: bool,
 }
 
 impl From<Cli> for AppConfig {
@@ -45,6 +49,7 @@ impl From<Cli> for AppConfig {
             profile: c.profile,
             region: c.region,
             command: c.command,
+            inspect: c.inspect,
         }
     }
 }
@@ -57,12 +62,16 @@ async fn main() -> Result<()> {
     let ecs = AwsEcsApi::from_env(cfg.profile.clone(), cfg.region.clone()).await?;
     let prompter = InquirePrompter;
 
-    let plan = build_plan(&cfg, &ecs, &prompter).await?;
-    println!(
-        "Connecting to cluster={}, service={}, task={}, container={} ...",
-        plan.cluster, plan.service, plan.task_id, plan.container
-    );
-    execute_plan(&plan)?;
+    if cfg.inspect {
+        inspect_tasks(&cfg, &ecs, &prompter).await?;
+    } else {
+        let plan = build_plan(&cfg, &ecs, &prompter).await?;
+        println!(
+            "Connecting to cluster={}, service={}, task={}, container={} ...",
+            plan.cluster, plan.service, plan.task_id, plan.container
+        );
+        execute_plan(&plan)?;
+    }
 
     Ok(())
 }
