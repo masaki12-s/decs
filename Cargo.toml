@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Dive into ECS: interactive ecs exec helper."
 license = "MIT"
-repository = "https://github.com/fastmedia/decs"
+repository = "https://github.com/masaki12-s/decs"
 keywords = ["aws", "ecs", "cli", "container"]
 categories = ["command-line-utilities"]
 
